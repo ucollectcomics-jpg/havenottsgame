@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+<title>Bully Free - PC Game Duck Update</title>
+<style>
+  html, body { margin:0; padding:0; width:100%; height:100%; overflow:hidden; background:#000; font-family:Arial, Helvetica, sans-serif; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; background:#000; touch-action:none; overflow:hidden; }
+  canvas { width:100vw; height:calc(100vw * 9 / 16); max-height:100vh; max-width:calc(100vh * 16 / 9); background:#000; display:block; image-rendering:auto; }
+  #buttons { position:fixed; left:50%; bottom:2.4vh; transform:translateX(-50%); display:flex; gap:22px; z-index:20; touch-action:none; user-select:none; }
+  .btn { width:82px; height:82px; border-radius:50%; border:5px solid rgba(0,0,0,.35); box-shadow:0 5px 10px rgba(0,0,0,.55), inset 0 5px 8px rgba(255,255,255,.45); color:white; font-size:52px; font-weight:bold; line-height:76px; text-align:center; text-shadow:0 3px 4px rgba(0,0,0,.55); cursor:pointer; touch-action:none; }
+  .left{background:linear-gradient(#b4ff65,#28bd24)} .up{background:linear-gradient(#fff58a,#e3b632)} .down{background:linear-gradient(#ffc06b,#dd7a17)} .right{background:linear-gradient(#f6a8ff,#9c2bd3)}
+  @media(max-width:800px){ .btn{width:58px;height:58px;line-height:53px;font-size:36px;border-width:3px}.buttons{gap:12px} }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="game" width="1920" height="1080"></canvas></div>
+<div id="buttons">
+  <div class="btn left" data-key="ArrowLeft">◀</div>
+  <div class="btn up" data-key="ArrowUp">▲</div>
+  <div class="btn down" data-key="ArrowDown">▼</div>
+  <div class="btn right" data-key="ArrowRight">▶</div>
+</div>
+<audio id="music" src="assets/music.mp3" loop preload="auto"></audio>
+<script>
+(() => {
+'use strict';
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+const W=1920, H=1080;
+const music = document.getElementById('music'); music.volume = 0.38;
+
+const AS = {
+  bg:'assets/background.png', load:'assets/loading.png', hero:'assets/hero.png', bully:'assets/bully.png', books:'assets/books.png', nice:'assets/coin_nice.png', nobully:'assets/coin_no_bullying.png'
+};
+const img = {}; let loaded=0; const keys=Object.keys(AS);
+keys.forEach(k=>{ img[k]=new Image(); img[k].onload=()=>loaded++; img[k].src=AS[k]; });
+
+let state='loading', loadStart=performance.now(), loadPct=0;
+let last=performance.now(), bgX=0, speed=355, phase=1, phaseTimer=0;
+const baseline=925; // bottom of character/obstacles, aligned to grass top
+let power=100, score=0;
+let objects=[], floatTexts=[];
+let spawnTimer=0;
+let sequenceIndex=0;
+const spawnSequence=['coin','books','coin','bully'];
+let flash=0;
+const hero = {x:210, y:baseline, w:300, h:169, vy:0, ground:baseline, jumping:false, duck:false, inv:0};
+const controls = {left:false,right:false,up:false,down:false};
+
+function clamp(v,a,b){return Math.max(a,Math.min(b,v));}
+function rand(a,b){return a+Math.random()*(b-a);}
+function playTone(freq=440, dur=.08, type='sine', vol=.16){
+  try{ const AC=window.AudioContext||window.webkitAudioContext; if(!window._ac) window._ac=new AC(); const ac=window._ac; const o=ac.createOscillator(), g=ac.createGain(); o.type=type; o.frequency.value=freq; g.gain.value=vol; o.connect(g); g.connect(ac.destination); o.start(); g.gain.exponentialRampToValueAtTime(0.0001, ac.currentTime+dur); o.stop(ac.currentTime+dur); }catch(e){}
+}
+function startMusic(){ music.play().catch(()=>{}); }
+
+function resetGame(){
+  state='playing'; bgX=0; speed=355; phase=1; phaseTimer=0; power=100; score=0; objects=[]; floatTexts=[]; spawnTimer=1.0; sequenceIndex=0; flash=0;
+  hero.x=210; hero.y=baseline; hero.vy=0; hero.jumping=false; hero.duck=false; hero.inv=0;
+}
+function addFloat(text,x,y,color){ floatTexts.push({text,x,y,vy:-70,life:1,color}); }
+function spawnEvent(){
+  const event = spawnSequence[sequenceIndex % spawnSequence.length];
+  sequenceIndex++;
+
+  if(event === 'books') {
+    // Floating books: the hero must DUCK under them.
+    const h = 112, w = 168;
+    objects.push({type:'books', x:W+90, y:690, w, h, hit:false, speedFactor:1});
+    spawnTimer = rand(2.2, 2.8) * (355/speed);
+    return;
+  }
+
+  if(event === 'bully') {
+    // Ground bully: the hero must JUMP over him.
+    const h = 140, w = 187;
+    objects.push({type:'bully', x:W+120, y:baseline-h, w, h, hit:false, speedFactor:1});
+    spawnTimer = rand(2.6, 3.4) * (355/speed);
+    return;
+  }
+
+  // Coins move slower and are spaced away from obstacles.
+  const s = 140;
+  const which = Math.random()<.5 ? 'nice' : 'nobully';
+  objects.push({type:'coin', coin:which, x:W+rand(180,360), y:rand(500,600), w:s, h:s, hit:false, speedFactor:.65});
+  spawnTimer = rand(1.7, 2.3);
+}
+function heroRect(){
+  const duck = hero.duck && !hero.jumping;
+  return {x:hero.x+45, y:hero.y-hero.h+(duck?62:25), w:hero.w-90, h:hero.h-(duck?75:45)};
+}
+function rects(a,b){return a.x < b.x+b.w && a.x+a.w > b.x && a.y < b.y+b.h && a.y+a.h > b.y;}
+function objectRect(o){
+  if(o.type==='books') return {x:o.x+22, y:o.y+22, w:o.w-44, h:o.h-44};
+  if(o.type==='bully') return {x:o.x+40, y:o.y+18, w:o.w-74, h:o.h-24};
+  return {x:o.x+16, y:o.y+16, w:o.w-32, h:o.h-32};
+}
+
+function update(dt){
+  if(state==='loading'){
+    const elapsed=(performance.now()-loadStart)/1000;
+    const assetPct=loaded/keys.length;
+    loadPct = Math.min(1, Math.max(elapsed/4.2, assetPct*0.7)); // force visible loading for 4.2s
+    if(elapsed>4.2 && loaded===keys.length){ resetGame(); }
+    return;
+  }
+  if(state==='gameover') return;
+  phaseTimer += dt; if(phaseTimer>=120){ phaseTimer=0; phase++; speed += 55; addFloat('PHASE '+phase, W/2-80, 260, '#fff'); }
+  if(controls.left) hero.x -= 260*dt;
+  if(controls.right) hero.x += 260*dt;
+  hero.x=clamp(hero.x,120,500);
+  if(controls.up && !hero.jumping){ hero.vy=-1250; hero.jumping=true; playTone(620,.10,'square',.08); }
+  hero.duck=controls.down;
+  hero.vy += 2150*dt; hero.y += hero.vy*dt;
+  if(hero.y>=hero.ground){ hero.y=hero.ground; hero.vy=0; hero.jumping=false; }
+  if(hero.inv>0) hero.inv-=dt;
+  if(flash>0) flash-=dt;
+  bgX -= (speed*.33)*dt;
+  const bgW=W-140;
+  if(bgX<=-bgW) bgX+=bgW;
+  spawnTimer -= dt;
+  if(spawnTimer<=0){ spawnEvent(); }
+  const hr=heroRect();
+  for(const o of objects){
+    o.x -= speed*(o.speedFactor || 1)*dt;
+    if(o.type==='coin') o.y += Math.sin(performance.now()/190 + o.x*.02)*0.45;
+    if(!o.hit && rects(hr,objectRect(o))){
+      o.hit=true;
+      if(o.type==='coin') { score+=10; power=clamp(power+10,0,100); addFloat('+10',o.x,o.y,'#ffe45c'); playTone(960,.09,'triangle',.13); }
+      else if(hero.inv<=0){ power=clamp(power-10,0,100); addFloat('-10',hero.x+140,hero.y-200,'#ff3333'); flash=.16; hero.inv=.85; playTone(150,.12,'sawtooth',.12); if(power<=0){state='gameover'; playTone(80,.35,'sawtooth',.18);} }
+    }
+  }
+  objects=objects.filter(o=> o.x > -350 && !(o.type==='coin' && o.hit));
+  for(const f of floatTexts){ f.y += f.vy*dt; f.life-=dt; }
+  floatTexts=floatTexts.filter(f=>f.life>0);
+}
+
+function drawLoading(){
+  ctx.clearRect(0,0,W,H);
+  if(img.load && img.load.complete) ctx.drawImage(img.load,0,0,W,H);
+  else { ctx.fillStyle='#09f'; ctx.fillRect(0,0,W,H); }
+  // Clean working loading bar, fill INSIDE the border only.
+  const bw=720,bh=48,bx=(W-bw)/2,by=875;
+  ctx.save(); ctx.globalAlpha=.96;
+  ctx.fillStyle='rgba(0,0,0,.55)'; roundRect(bx-9,by-9,bw+18,bh+18,30,true,false);
+  ctx.strokeStyle='white'; ctx.lineWidth=5; roundRect(bx-9,by-9,bw+18,bh+18,30,false,true);
+  ctx.fillStyle='#1c2b3b'; roundRect(bx,by,bw,bh,24,true,false);
+  const fillW=(bw-8)*loadPct;
+  let grd=ctx.createLinearGradient(bx,0,bx+bw,0); grd.addColorStop(0,'#26ff22'); grd.addColorStop(.65,'#cfff27'); grd.addColorStop(1,'#ffb12a');
+  ctx.fillStyle=grd; roundRect(bx+4,by+4,fillW,bh-8,20,true,false);
+  ctx.fillStyle='white'; ctx.font='bold 34px Arial'; ctx.textAlign='center'; ctx.lineWidth=5; ctx.strokeStyle='#05224a'; ctx.strokeText('LOADING...',W/2,by-26); ctx.fillText('LOADING...',W/2,by-26);
+  ctx.restore();
+}
+function drawBg(){
+  // Draw the same schoolyard background twice in the same direction.
+  // The seam is softened with an overlapped blurred strip so the loop change is not harsh.
+  const bgW=W, overlap=140, x=bgX;
+  ctx.drawImage(img.bg,x,0,bgW,H);
+  ctx.drawImage(img.bg,x+bgW-overlap,0,bgW,H);
+  const seam=x+bgW-overlap;
+  if(seam>-overlap && seam<W+overlap){
+    ctx.save();
+    ctx.beginPath(); ctx.rect(seam-90,0,180,H); ctx.clip();
+    ctx.globalAlpha=.55; ctx.filter='blur(18px)';
+    ctx.drawImage(img.bg,x+bgW-overlap-90,0,bgW,H);
+    ctx.filter='none';
+    const fade=ctx.createLinearGradient(seam-120,0,seam+120,0);
+    fade.addColorStop(0,'rgba(255,255,255,0)');
+    fade.addColorStop(.5,'rgba(255,255,255,.12)');
+    fade.addColorStop(1,'rgba(255,255,255,0)');
+    ctx.fillStyle=fade; ctx.fillRect(seam-120,0,240,H);
+    ctx.restore();
+  }
+}
+function drawPower(){
+  const bx=650, by=115, bw=620, bh=52;
+  ctx.save(); ctx.textAlign='center'; ctx.font='900 70px Arial Black, Arial'; ctx.lineWidth=10; ctx.strokeStyle='#602000'; ctx.fillStyle='#ffe45c'; ctx.strokeText('BULLY POWER', W/2, 103); ctx.fillText('BULLY POWER', W/2, 103);
+  ctx.fillStyle='rgba(52,20,8,.9)'; roundRect(bx-14,by-12,bw+28,bh+24,36,true,false);
+  ctx.strokeStyle='#ffe174'; ctx.lineWidth=7; roundRect(bx-14,by-12,bw+28,bh+24,36,false,true);
+  ctx.fillStyle='#21120a'; roundRect(bx,by,bw,bh,26,true,false);
+  const fw=(bw-8)*(power/100);
+  const grd=ctx.createLinearGradient(bx,0,bx+bw,0); grd.addColorStop(0,'#22fb20'); grd.addColorStop(.6,'#f6ef28'); grd.addColorStop(1,'#ff6b18');
+  ctx.fillStyle=grd; roundRect(bx+4,by+4,fw,bh-8,22,true,false);
+  ctx.font='bold 32px Arial'; ctx.lineWidth=6; ctx.strokeStyle='#000'; ctx.fillStyle='white'; ctx.textAlign='left'; ctx.strokeText(Math.round(power)+'%', bx+bw+28, by+38); ctx.fillText(Math.round(power)+'%', bx+bw+28, by+38);
+  ctx.restore();
+}
+function drawGame(){
+  ctx.clearRect(0,0,W,H); drawBg();
+  // draw objects: coins first in sky, then ground obstacles
+  for(const o of objects){
+    if(o.hit && o.type==='coin') continue;
+    if(o.type==='coin') ctx.drawImage(o.coin==='nice'?img.nice:img.nobully, o.x,o.y,o.w,o.h);
+  }
+  for(const o of objects){
+    if(o.type==='books') ctx.drawImage(img.books,o.x,o.y,o.w,o.h);
+    else if(o.type==='bully') ctx.drawImage(img.bully,o.x,o.y,o.w,o.h);
+  }
+  const dh=hero.duck && !hero.jumping ? hero.h*0.72 : hero.h;
+  const dy=hero.y-dh;
+  ctx.save(); if(hero.inv>0 && Math.floor(performance.now()/80)%2===0) ctx.globalAlpha=.55; ctx.drawImage(img.hero, hero.x, dy, hero.w, dh); ctx.restore();
+  drawPower();
+  ctx.font='900 46px Arial'; ctx.lineWidth=7; ctx.strokeStyle='#000'; ctx.fillStyle='#fff'; ctx.textAlign='left'; ctx.strokeText('Score: '+score,40,70); ctx.fillText('Score: '+score,40,70);
+  ctx.textAlign='right'; ctx.strokeText('Phase: '+phase,W-40,70); ctx.fillText('Phase: '+phase,W-40,70);
+  for(const f of floatTexts){ ctx.save(); ctx.globalAlpha=Math.max(0,f.life); ctx.font='900 46px Arial'; ctx.lineWidth=6; ctx.strokeStyle='#000'; ctx.fillStyle=f.color; ctx.strokeText(f.text,f.x,f.y); ctx.fillText(f.text,f.x,f.y); ctx.restore(); }
+  if(flash>0){ ctx.fillStyle='rgba(255,0,0,.20)'; ctx.fillRect(0,0,W,H); }
+  if(state==='gameover'){
+    ctx.fillStyle='rgba(0,0,0,.55)'; ctx.fillRect(0,0,W,H); ctx.textAlign='center'; ctx.font='900 90px Arial Black'; ctx.lineWidth=10; ctx.strokeStyle='#000'; ctx.fillStyle='#fff'; ctx.strokeText('GAME OVER',W/2,H/2-20); ctx.fillText('GAME OVER',W/2,H/2-20); ctx.font='bold 42px Arial'; ctx.strokeText('Press any arrow or tap a button to restart',W/2,H/2+55); ctx.fillText('Press any arrow or tap a button to restart',W/2,H/2+55);
+  }
+}
+function roundRect(x,y,w,h,r,fill,stroke){ if(w<0) w=0; r=Math.min(r,w/2,h/2); ctx.beginPath(); ctx.moveTo(x+r,y); ctx.arcTo(x+w,y,x+w,y+h,r); ctx.arcTo(x+w,y+h,x,y+h,r); ctx.arcTo(x,y+h,x,y,r); ctx.arcTo(x,y,x+w,y,r); ctx.closePath(); if(fill)ctx.fill(); if(stroke)ctx.stroke(); }
+function loop(t){ const dt=Math.min(.033,(t-last)/1000); last=t; update(dt); if(state==='loading') drawLoading(); else drawGame(); requestAnimationFrame(loop); }
+requestAnimationFrame(loop);
+
+function press(key,down){
+  if(['ArrowLeft','ArrowRight','ArrowUp','ArrowDown','Space'].includes(key)) { event && event.preventDefault && event.preventDefault(); }
+  if(state==='gameover' && down){ resetGame(); startMusic(); }
+  if(state==='loading' && down){ startMusic(); }
+  if(key==='ArrowLeft') controls.left=down;
+  if(key==='ArrowRight') controls.right=down;
+  if(key==='ArrowUp' || key===' ') controls.up=down;
+  if(key==='ArrowDown') controls.down=down;
+}
+window.addEventListener('keydown',e=>{ if(['ArrowLeft','ArrowRight','ArrowUp','ArrowDown',' '].includes(e.key)) e.preventDefault(); press(e.key,true); startMusic(); },{passive:false});
+window.addEventListener('keyup',e=>{ if(['ArrowLeft','ArrowRight','ArrowUp','ArrowDown',' '].includes(e.key)) e.preventDefault(); press(e.key,false); },{passive:false});
+['touchstart','touchmove','wheel'].forEach(ev=>document.addEventListener(ev,e=>{ if(ev==='wheel') e.preventDefault(); },{passive:false}));
+document.querySelectorAll('.btn').forEach(b=>{
+  const key=b.dataset.key;
+  const on=e=>{e.preventDefault(); press(key,true); startMusic();};
+  const off=e=>{e.preventDefault(); press(key,false);};
+  b.addEventListener('mousedown',on); b.addEventListener('mouseup',off); b.addEventListener('mouseleave',off);
+  b.addEventListener('touchstart',on,{passive:false}); b.addEventListener('touchend',off,{passive:false}); b.addEventListener('touchcancel',off,{passive:false});
+});
+canvas.addEventListener('click',()=>startMusic());
+})();
+</script>
+</body>
+</html>
